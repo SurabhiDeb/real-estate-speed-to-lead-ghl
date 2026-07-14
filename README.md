@@ -79,7 +79,9 @@ The enrich → score → gate-the-send-on-consent+value+confidence → draft →
 
 ---
 
-Built by Surabhi Deb as part of an AI automation portfolio. [See the full project index](https://github.com/YOUR-USERNAME) for related builds (voice lead qualification, RAG support agents, financial reporting automation).
+Built by Surabhi Deb as part of an AI automation portfolio. [See the full project index](https://surabhideb.github.io/earlyecho-website/) for related builds (voice lead qualification, RAG support agents, financial reporting automation).
+<img width="1728" height="538" alt="Lead-to-Proposal" src="https://github.com/user-attachments/assets/43b61100-432b-4b8c-8824-5a811e3914c1" />
+
 
 ## License
 
