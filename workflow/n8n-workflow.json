@@ -1,0 +1,289 @@
+{
+  "name": "Lead-to-Proposal — Speed-to-Lead + Auto-Draft (Real Estate / GoHighLevel)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "new-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "New Lead (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 520],
+      "webhookId": "new-lead",
+      "notes": "DEMO: POST a mock lead here. LIVE: point Zillow/Realtor.com ADF, Facebook Lead Ads, or your IDX form at this URL — or use GoHighLevel's inbound-lead webhook. Expected body: {name, phone, email, source, inquiry_message, property_or_search, budget, timeline, financing_note, sms_consent, email_consent}."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- ENRICH + NORMALIZE ----\n// Sources are messy and inconsistent (Zillow ADF vs Facebook form vs IDX widget).\n// Standardize everything so the scorer and drafter get clean, comparable input.\nconst b = $json.body || {};\n\nconst digits = (s) => (s || '').toString().replace(/[^0-9]/g, '');\nconst phoneRaw = digits(b.phone);\nconst phone = phoneRaw.length === 10 ? phoneRaw : (phoneRaw.length === 11 && phoneRaw.startsWith('1') ? phoneRaw.slice(1) : phoneRaw);\nconst phoneValid = phone.length === 10;\n\nconst name = (b.name || '').trim();\nconst firstName = name.split(' ')[0] || 'there';\nconst email = (b.email || '').trim().toLowerCase();\nconst emailValid = /.+@.+\\..+/.test(email);\n\n// Consent: only TRUE if the source explicitly captured it. Default to FALSE.\nconst smsConsent = b.sms_consent === true || b.sms_consent === 'true';\nconst emailConsent = b.email_consent === true || b.email_consent === 'true';\n\n// What's missing — surfaced to the agent and used by the scorer.\nconst missing = [];\nif (!phoneValid) missing.push('valid phone');\nif (!emailValid) missing.push('valid email');\nif (!b.budget) missing.push('budget');\nif (!b.timeline) missing.push('timeline');\n\nreturn [{ json: {\n  name, firstName, phone, phoneValid, email, emailValid,\n  smsConsent, emailConsent,\n  source: b.source || 'unknown',\n  property_or_search: b.property_or_search || b.inquiry_message || 'general inquiry',\n  inquiry_message: b.inquiry_message || '',\n  budget: b.budget || '',\n  timeline: b.timeline || '',\n  financing_note: b.financing_note || '',\n  missing_info_pre: missing\n} }];"
+      },
+      "id": "enrich",
+      "name": "Enrich + Normalize Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 520]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "gpt-4o-mini", "cachedResultName": "gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "You are a real estate lead qualification classifier for a team on GoHighLevel. Return ONLY JSON: {\"intent\":\"buyer|seller|renter|unknown\",\"price_band\":\"entry|mid|high|luxury|unknown\",\"timeline\":\"now|0_3_months|3_plus_months|just_looking|unknown\",\"financing\":\"pre_approved|needs_lender|cash|unknown\",\"source_quality\":\"high|medium|low\",\"score\":\"hot|warm|cold\",\"missing_info\":[],\"reason\":\"one sentence\"}. hot=clear intent+near-term+financing known+specific property. warm=clear intent but soft timeline/unknown financing/light detail. cold=vague, just-looking, spam, or no usable contact. Never invent details; unknown if absent. Use price_band 'luxury' only for explicitly high-end inquiries, else 'unknown' — do NOT guess luxury. Output valid JSON only." },
+            { "role": "user", "content": "=LEAD SOURCE: {{ $json.source }}\nPROPERTY / SEARCH: {{ $json.property_or_search }}\nINQUIRY MESSAGE: {{ $json.inquiry_message }}\nSTATED BUDGET: {{ $json.budget }}\nSTATED TIMELINE: {{ $json.timeline }}\nFINANCING NOTE: {{ $json.financing_note }}\nCONTACT: name={{ $json.name }} phone_valid={{ $json.phoneValid }} email_valid={{ $json.emailValid }}" }
+          ]
+        },
+        "jsonOutput": true,
+        "options": { "temperature": 0 }
+      },
+      "id": "score-lead",
+      "name": "LLM · Score Lead",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [660, 520],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- THE SEND-DECISION GATE: this node decides, not the LLM ----\n// Auto-send the first touch ONLY IF all three hold:\n//   1) consent captured for a channel, AND\n//   2) score is a clean standard lead (hot/warm, not cold), AND\n//   3) NOT flagged high-value (luxury) and NOT too ambiguous to touch.\n// Anything else -> draft anyway, but route to a human for one-tap approval.\n\nconst e = $('Enrich + Normalize Lead').item.json;\n\n// Parse the scorer output defensively (OpenAI node shape varies by version).\nlet s = { intent:'unknown', price_band:'unknown', timeline:'unknown', financing:'unknown', source_quality:'low', score:'cold', missing_info:[], reason:'' };\ntry {\n  const c = $json;\n  const txt = c.message?.content ?? c.content ?? c.text ?? JSON.stringify(c);\n  s = typeof txt === 'string' ? JSON.parse(txt) : txt;\n} catch (err) { /* fail safe: treat as cold -> human */ }\n\nconst hasSmsPath = e.smsConsent && e.phoneValid;\nconst hasEmailPath = e.emailConsent && e.emailValid;\nconst hasConsentChannel = hasSmsPath || hasEmailPath;\n\nconst isHighValue = s.price_band === 'luxury';\nconst isColdOrSpam = s.score === 'cold' || s.source_quality === 'low';\nconst tooAmbiguous = s.intent === 'unknown' || (e.missing_info_pre || []).includes('valid phone') && !hasEmailPath;\n\n// Reasons the system will NOT auto-send (each maps to a real risk).\nconst holdReasons = [];\nif (!hasConsentChannel) holdReasons.push('no_consent');          // TCPA boundary — legal, not tunable\nif (isHighValue)        holdReasons.push('high_value');          // luxury lead deserves a human first\nif (isColdOrSpam)       holdReasons.push('cold_or_low_quality'); // don't spend a fast touch on spam\nif (tooAmbiguous)       holdReasons.push('too_ambiguous');       // can't read it -> don't fire blind\n\nconst decision = holdReasons.length === 0 ? 'auto_send' : 'human_approval';\n\n// Which channel would we send on if auto (SMS preferred for speed, else email).\nconst channel = hasSmsPath ? 'sms' : (hasEmailPath ? 'email' : 'none');\n\n// A sensible next step for the drafter.\nconst nextStep = s.intent === 'seller' ? 'offer a quick market value chat'\n               : s.timeline === 'now' || s.timeline === '0_3_months' ? 'book a showing'\n               : 'confirm what they are looking for';\n\nreturn [{ json: {\n  ...e,\n  score: s.score, intent: s.intent, price_band: s.price_band,\n  timeline_scored: s.timeline, financing: s.financing,\n  source_quality: s.source_quality, scorer_reason: s.reason,\n  missing_info: [...new Set([...(e.missing_info_pre||[]), ...(s.missing_info||[])])],\n  hasSmsPath, hasEmailPath, channel,\n  decision, holdReasons, holdReasonText: holdReasons.join(', ') || 'none',\n  nextStep\n} }];"
+      },
+      "id": "gate",
+      "name": "Send-Decision Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 520]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "gpt-4o-mini", "cachedResultName": "gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "You draft the FIRST-TOUCH follow-up for a real estate agent, in the agent's voice. Return ONLY JSON: {\"sms\":\"160-320 chars, warm, specific, one clear question/next step, ends with opt-out\",\"email\":{\"subject\":\"short, specific\",\"body\":\"3-5 short sentences, same next step, signed by the agent\"}}. HARD RULES: never quote a price, promise a specific home is available, or commit to terms/times/financing — invite, don't promise. Never invent property/market/lead details; use only what's given. The SMS MUST end with an opt-out (e.g. 'Reply STOP to opt out.'). Reference the SPECIFIC property/search and the actual inquiry — no generic 'thanks for your interest'. Sound like a real person texting: short, human, one ask. Use the agent name/team as given; add no fake claims." },
+            { "role": "user", "content": "=AGENT: {{ $json.agent_name || 'Jordan' }}, {{ $json.team_name || 'The Home Team' }}\nLEAD NAME: {{ $json.firstName }}\nINTENT / SCORE: {{ $json.intent }} / {{ $json.score }}\nPROPERTY / SEARCH: {{ $json.property_or_search }}\nINQUIRY MESSAGE: {{ $json.inquiry_message }}\nTIMELINE: {{ $json.timeline_scored }}   FINANCING: {{ $json.financing }}\nNEXT STEP TO INVITE: {{ $json.nextStep }}\nBOOKING LINK (include in email if present): {{ $json.booking_link || '' }}" }
+          ]
+        },
+        "jsonOutput": true,
+        "options": { "temperature": 0.4 }
+      },
+      "id": "draft",
+      "name": "LLM · Draft First-Touch",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1100, 520],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- SAFETY DOUBLE-CHECK on the draft (belt and suspenders) ----\n// The drafter is instructed to include an opt-out and avoid price commitments,\n// but we do NOT rely on the prompt alone for the SMS opt-out — verify in code.\nconst g = $('Send-Decision Gate').item.json;\n\nlet d = { sms: '', email: { subject: '', body: '' } };\ntry {\n  const c = $json;\n  const txt = c.message?.content ?? c.content ?? c.text ?? JSON.stringify(c);\n  d = typeof txt === 'string' ? JSON.parse(txt) : txt;\n} catch (e) { /* leave empty; will route to human */ }\n\nlet sms = (d.sms || '').trim();\n// Enforce opt-out on any SMS regardless of what the model returned.\nif (sms && !/stop/i.test(sms)) sms = sms.replace(/\\s*$/, '') + ' Reply STOP to opt out.';\n\nconst draftValid = sms.length > 0 && (d.email?.body || '').length > 0;\n\nreturn [{ json: { ...g, draft_sms: sms, draft_email_subject: d.email?.subject || '', draft_email_body: d.email?.body || '', draftValid } }];"
+      },
+      "id": "draft-check",
+      "name": "Enforce Opt-out + Validate Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 520]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "auto_send",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "leftValue": "={{ $json.draftValid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "route",
+      "name": "Auto-send or Human Approval?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1540, 520],
+      "notes": "Auto-send ONLY if the gate said auto_send AND the draft validated. If the draft failed to parse, even a clean lead routes to a human — never send an empty/garbled text."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: $json.channel === 'sms' ? 'SMS' : 'Email', contactId: '{{REPLACE_WITH_GHL_CONTACT_ID_FROM_UPSERT}}', message: $json.channel === 'sms' ? $json.draft_sms : $json.draft_email_body, subject: $json.draft_email_subject }) }}",
+        "options": {}
+      },
+      "id": "ghl-send",
+      "name": "GoHighLevel · Send First-Touch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 380],
+      "credentials": {
+        "httpHeaderAuth": { "id": "REPLACE_WITH_GHL_CRED", "name": "GoHighLevel (Bearer token)" }
+      },
+      "notes": "LIVE: sends on the client's GHL number/inbox so it's in their conversation history. Attach an HTTP Header Auth cred: Authorization = Bearer <GHL_API_TOKEN>. In practice you'd upsert the contact first (see GHL Upsert node) and use the returned contactId here. DEMO: disable this node or point it at a mock — the Slack log shows what WOULD have sent."
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "mode": "name", "value": "#lead-desk" },
+        "text": "=:white_check_mark: *Auto-sent first touch* — {{ $json.score }} lead via {{ $json.channel }}\n*Lead:* {{ $json.name }} ({{ $json.source }})  |  *Property:* {{ $json.property_or_search }}\n*Why auto-sent:* consent captured, standard lead, not high-value\n*Sent:* {{ $json.channel === 'sms' ? $json.draft_sms : $json.draft_email_subject }}",
+        "otherOptions": {}
+      },
+      "id": "slack-log",
+      "name": "Slack · Log Auto-send",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2020, 380],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_WITH_SLACK_CRED", "name": "Slack account" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "mode": "name", "value": "#lead-desk" },
+        "text": "=:hand: *Needs you — approve to send*  ({{ $json.score }} lead)\n*Hold reason:* {{ $json.holdReasonText }}\n*Lead:* {{ $json.name }}  |  *Phone:* {{ $json.phone }}  |  *Source:* {{ $json.source }}\n*Property / search:* {{ $json.property_or_search }}\n*Read:* {{ $json.scorer_reason }}\n\n*Drafted SMS (verify before sending):*\n{{ $json.draft_sms }}\n\n*Drafted email — {{ $json.draft_email_subject }}:*\n{{ $json.draft_email_body }}\n\n_Approve / Edit / Skip. Nothing was sent automatically._",
+        "otherOptions": {}
+      },
+      "id": "slack-approve",
+      "name": "Slack · Human Approval Queue",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1780, 660],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_WITH_SLACK_CRED", "name": "Slack account" }
+      },
+      "notes": "THE MONEY SHOT. Held leads (no consent / high-value / cold / ambiguous) arrive as a ready-to-send draft plus the score and the reason for the hold. The agent approves in one tap. For a live build, add interactive Slack buttons or use GHL's conversation view as the approval surface."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/upsert",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ locationId: '{{REPLACE_WITH_GHL_LOCATION_ID}}', firstName: $json.firstName, name: $json.name, phone: $json.phoneValid ? ('+1' + $json.phone) : undefined, email: $json.emailValid ? $json.email : undefined, source: $json.source, tags: [ 'lead-score:' + $json.score, 'touch:' + $json.decision ], customFields: [ { key: 'lead_score', field_value: $json.score }, { key: 'price_band', field_value: $json.price_band }, { key: 'first_touch', field_value: $json.decision } ] }) }}",
+        "options": {}
+      },
+      "id": "ghl-upsert",
+      "name": "GoHighLevel · Upsert Contact + Score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2020, 520],
+      "credentials": {
+        "httpHeaderAuth": { "id": "REPLACE_WITH_GHL_CRED", "name": "GoHighLevel (Bearer token)" }
+      },
+      "notes": "Write-back / system of record. Upserts the contact with the lead score, price band, and whether the first touch was auto-sent or held. In a full build you'd also move the opportunity into the right pipeline stage. DEMO: disable or mock — the workflow still runs end-to-end without a live GHL account."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', lead: $json.name, score: $json.score, decision: $json.decision, hold_reasons: $json.holdReasons, channel: $json.channel, drafted: true }) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond to Source",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2260, 520]
+    },
+    {
+      "parameters": {
+        "content": "## Lead-to-Proposal — Speed-to-Lead + Auto-Draft\n\n**The whole point lives in the `Send-Decision Gate` node.** The LLM scores and drafts; it does NOT decide whether to send. The gate does.\n\n**Auto-send the first touch ONLY IF all three hold:**\n- consent captured for a channel (SMS or email), AND\n- score is a clean standard lead (not cold/spam), AND\n- NOT high-value (luxury) and NOT too ambiguous.\n\nEverything else → draft anyway, route to a human for one-tap approval. Nothing is auto-sent.\n\n### Flow (left → right)\n1. **Enrich + Normalize** (clean messy multi-source input) → 2. **LLM · Score Lead** → 3. **Send-Decision Gate** (the decision) → 4. **LLM · Draft First-Touch** → 5. **Enforce Opt-out + Validate**.\n6a. **Auto-send path:** GHL sends → Slack logs it.\n6b. **Human path:** Slack approval queue with draft + score + hold reason (the money shot).\nBoth paths → **GHL Upsert** (score + first-touch logged) → respond.\n\n**Judgment boundaries (why a client trusts it):** never auto-text without consent (TCPA), never auto-send a luxury lead, never quote price/terms, always include an SMS opt-out (enforced in code, not just the prompt).",
+        "height": 380,
+        "width": 520,
+        "color": 5
+      },
+      "id": "sticky-overview",
+      "name": "How the gate works",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [820, 40]
+    },
+    {
+      "parameters": {
+        "content": "### Credentials to set (once)\n- **OpenAI account** → on `LLM · Score Lead` and `LLM · Draft First-Touch`. (Swap to Claude by replacing these two nodes; the gate is model-agnostic.)\n- **Slack account** → on both Slack nodes. Set the channel (e.g. `#lead-desk`).\n- **GoHighLevel (Bearer token)** → HTTP Header Auth: `Authorization = Bearer <GHL_API_TOKEN>`, on the two GHL nodes. Set `Version: 2021-07-28`. Fill `locationId` (your GHL sub-account) and the `contactId` from the upsert response.\n\n### Demo vs live\n- **DEMO:** POST a mock lead to the webhook. Disable the two GHL nodes (or mock them) — the Slack messages show exactly what would have sent. The gate, scoring, drafting, and routing all run with zero external accounts except OpenAI + Slack.\n- **LIVE:** point real lead sources (Zillow/Realtor.com ADF, Facebook Lead Ads, IDX form, or GHL inbound webhook) at the Production URL; enable the GHL nodes; set Active.\n\n### Config the client tunes (NOT hard-coded logic)\n- Price band → `luxury` cutoff (in the scorer prompt / your market).\n- Score thresholds and which scores auto-send.\n- Consent source of truth.\n- Agent name / team / voice / booking link.",
+        "height": 420,
+        "width": 460,
+        "color": 4
+      },
+      "id": "sticky-setup",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1780, 900]
+    }
+  ],
+  "connections": {
+    "New Lead (Webhook)": {
+      "main": [[{ "node": "Enrich + Normalize Lead", "type": "main", "index": 0 }]]
+    },
+    "Enrich + Normalize Lead": {
+      "main": [[{ "node": "LLM · Score Lead", "type": "main", "index": 0 }]]
+    },
+    "LLM · Score Lead": {
+      "main": [[{ "node": "Send-Decision Gate", "type": "main", "index": 0 }]]
+    },
+    "Send-Decision Gate": {
+      "main": [[{ "node": "LLM · Draft First-Touch", "type": "main", "index": 0 }]]
+    },
+    "LLM · Draft First-Touch": {
+      "main": [[{ "node": "Enforce Opt-out + Validate Draft", "type": "main", "index": 0 }]]
+    },
+    "Enforce Opt-out + Validate Draft": {
+      "main": [[{ "node": "Auto-send or Human Approval?", "type": "main", "index": 0 }]]
+    },
+    "Auto-send or Human Approval?": {
+      "main": [
+        [{ "node": "GoHighLevel · Send First-Touch", "type": "main", "index": 0 }],
+        [{ "node": "Slack · Human Approval Queue", "type": "main", "index": 0 }]
+      ]
+    },
+    "GoHighLevel · Send First-Touch": {
+      "main": [[{ "node": "Slack · Log Auto-send", "type": "main", "index": 0 }]]
+    },
+    "Slack · Log Auto-send": {
+      "main": [[{ "node": "GoHighLevel · Upsert Contact + Score", "type": "main", "index": 0 }]]
+    },
+    "Slack · Human Approval Queue": {
+      "main": [[{ "node": "GoHighLevel · Upsert Contact + Score", "type": "main", "index": 0 }]]
+    },
+    "GoHighLevel · Upsert Contact + Score": {
+      "main": [[{ "node": "Respond to Source", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
